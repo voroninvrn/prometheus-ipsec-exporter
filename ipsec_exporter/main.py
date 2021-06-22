@@ -3,48 +3,66 @@
 import subprocess
 import glob
 import re
+import vici
+import multiprocessing
+import collections
+import time
 from sys import exit
 from flask import Flask, Response
 from prometheus_client import Gauge, generate_latest
+import prometheus_client as prom
+import os
+import time
+import argparse as ap
+from re import search
+
+class VState(object):
+    """holds the VPN state"""
+    def __init__(self):
+        self.alive = True
+        self.session = vici.Session()
+        self.possible_connections = []
 
 
 class IpsecExporter:
-    def __init__(self):
+    def __init__(self,  queue = None):
+        self.state = VState()
+        self.connections = self.get_possible_connections()
+     
         self.app = Flask(__name__)
-        self.connections = self.get_connections()
-        if not self.connections:
-            print("There's no files in /etc/ipsec.conf/")
-            exit(1)
-        self.gauge = Gauge("ipsec_tunnel_status", "Output from the check_ipsec script", ["connection_name"])
-        self.rtt = Gauge("ipsec_tunnel_rtt", "Output from the check_ipsec script", ["connection_name"])
+        self.state = VState()
+
+        self.gauge = Gauge("ipsec_tunnel_status", "Output from the charon.vici socket", ["connection_name"])
+        self.gauge2 = Gauge("ipsec_tunnel_in_bytes", "Output from the charon.vici socket", ["connection_name"])
+        self.gauge3 = Gauge("ipsec_tunnel_out_bytes", "Output from the charon.vici socket", ["connection_name"])
         self.run_webserver()
 
-    def get_connections(self):
-        "Get ipsec's connection name with it's initialized prometheus gauge."
-        ipsec_conf_files = glob.glob('/etc/ipsec.conf')
-        connections = []
+    def get_possible_connections(self):
+        ''' get all connections '''
+        state = self.state
+        state.possible_connections = []
+        for conn in state.session.list_conns():
+            for key in conn:
+                state.possible_connections.append(key)
 
-        for ipsec_conf_file in ipsec_conf_files:
-            # Read all files on /etc/ipsec.conf/*.conf
-            f = open(ipsec_conf_file)
-            lines = f.readlines()
-            f.close()
-            # Get all lines that match with the next regex
-            r = re.compile("^conn")
-            # Assume there"s only one conn per file and change some chars
-            connection = list(filter(r.match, lines))[1:]
-            for conn in connection[:]:
-                connection = str(conn).replace("\n", "")
-                connection = str(connection).replace("conn", "")
-                connections.append(connection)
+        return state.possible_connections
 
-        return connections
+    def get_active_connections(self):
+        ''' get active connections '''
+        state = self.state
+        state.active_connections = []
+        for conn in state.session.list_sas():
+            for key in conn:
+                state.active_connections.append(key)
+
+        return state.active_connections
 
     def serve_metrics(self):
         "Main method to serve the metrics."
         connections = self.connections
         gauge = self.gauge
-        rtt = self.rtt
+        gauge2 = self.gauge2
+        gauge3 = self.gauge3
 
         @self.app.route("/metrics")
         def metrics():
@@ -52,17 +70,38 @@ class IpsecExporter:
             Flask endpoint to expose the prometheus metrics. With every request
             it gets, it executes the 'check_ipsec' command.
             """
+            state = self.state
+            activeconn = self.get_active_connections()
             for conn in connections:
-                ipsec_process = subprocess.run(["check_ipsec", conn], stdout=subprocess.PIPE)
-                ipsec_process = float(ipsec_process.stdout)
-                gauge.labels(conn).set(ipsec_process)
+                if conn in activeconn:
+                     gauge.labels(conn).set('1')
 
-    #        metrics = generate_latest()
+                     for vpn_conn in state.session.list_sas():
+                         for key in vpn_conn:
+                             try:
+                                 child = vpn_conn[key]['child-sas']
+                                 if child == {}:
+                                     child = None
+                             except:
+                       #       print ('tunnel not connected at child level!')
+                                     child = None
+                             if child is not None:
+                            #     print (child)
+                                 for child_key in child:
+                                     if search(key, child_key):
+            #                         print ('time: ', time.time(), 'child key', child_key, 'bytes-in', child[child_key]['bytes-in'], 'bytes-out', child[child_key]['bytes-out'])
 
-     #       for conn in connections:
-                ipsec_process_rtt = subprocess.run(['check_ipsec', 'rtt', conn], stdout=subprocess.PIPE)
-                ipsec_process_rtt = float(ipsec_process_rtt.stdout)
-                rtt.labels(conn).set(ipsec_process_rtt)
+                               #      print ('in: ', child[child_key]['bytes-in'])
+                                       in_bytes = child[child_key]['bytes-in']
+                                       in_bytes = float(str(in_bytes, 'utf-8'))
+                                  #  print ('out: ', child[child_key]['bytes-out'])
+                                       out_bytes = child[child_key]['bytes-out']
+                                       out_bytes = float(str(out_bytes, 'utf-8'))
+                                       
+                                       gauge2.labels(key).set(in_bytes)
+                                       gauge3.labels(key).set(out_bytes)
+                else:                                                  
+                     gauge.labels(conn).set('0')
 
             metrics = generate_latest()
 
@@ -75,7 +114,7 @@ class IpsecExporter:
             port="9000",
             host="0.0.0.0",
             use_reloader=False,
-            debug=False
+            debug=True
         )
 
 
